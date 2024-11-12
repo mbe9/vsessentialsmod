@@ -173,7 +173,8 @@ namespace Vintagestory.GameContent
                     var constraint = new ClothConstraint(p1, p2);
                     Constraints.Add(constraint);
                 }
-            } else
+            }
+            else
             {
                 for (int i = 0; i <= totalPoints; i++)
                 {

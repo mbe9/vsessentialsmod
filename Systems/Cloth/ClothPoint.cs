@@ -18,9 +18,9 @@ namespace Vintagestory.GameContent
         [ProtoMember(2)]
         public float Mass;
         [ProtoMember(3)]
-        public float InvMass;
-        [ProtoMember(4)]
         public Vec3d Pos;
+        [ProtoMember(4)]
+        public Vec3d PrevPos;
         [ProtoMember(5)]
         public Vec3f Velocity = new Vec3f();
         [ProtoMember(6)]
@@ -40,6 +40,7 @@ namespace Vintagestory.GameContent
         [ProtoMember(13)]
         string pinnedToPlayerUid; // player entity ids change over time >.<
 
+        public float InvMass;
 
         public bool Dirty { get; internal set; }
 
@@ -325,4 +326,3 @@ namespace Vintagestory.GameContent
     }
 
 }
- 
