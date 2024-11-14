@@ -16,117 +16,135 @@ namespace Vintagestory.GameContent
     [ProtoContract]
     public enum ConstraintComparison
     {
+        // Solve for the constraint equation C(x) = 0
         Equal,
+        // Solve for the constraint equation C(x) < 0
         LessThan,
+        // Solve for the constraint equation C(x) > 0
         GreaterThan,
     }
    
     [ProtoContract]
     public class ClothConstraint
     {
-        static Random Rand = new Random();
-
-
         [ProtoMember(1)]
         public int[] PointIndices;
         [ProtoMember(2)]
-        public int PointIndex2;
+        public double Compliance;
         [ProtoMember(3)]
-        // Only used for angle constraint
-        public int PointIndex3;
-        [ProtoMember(4)]
-        public float Compliance;
-        [ProtoMember(5)]
         // Generic parameter that might be interpreted differently
         // by different types of constraints
         // - Distance constraint: target distance between points
         // - Angle constraint: target angle between lines
-        public float Param1;
-        [ProtoMember(6)]
+        public double Param1;
+        [ProtoMember(4)]
         public ConstraintType Type;
-        [ProtoMember(7)]
+        [ProtoMember(5)]
         public ConstraintComparison Comparison;
-
-
-        [ProtoMember(3)]
-        float squared_rest_length;
-
+        [ProtoMember(6)]
+        public double Damping;
 
         ClothPoint[] points;
         public ClothPoint Point1 => points[0];
         public ClothPoint Point2 => points[1];
         public ClothPoint Point3 => points[2];
 
-        static ParticlePhysics pp;
-        static double TickTime = pp.PhysicsTickTime;
-        static double InvTickTime = 1.0 / pp.PhysicsTickTime;
-        static double InvTickTimeSqr = 1.0 / (pp.PhysicsTickTime * pp.PhysicsTickTime);
-
-        float rest_length;
-        float inverse_length;
-        Vec3f tensionDirection = new Vec3f();
-        private float StretchStiffness = 200f;
-        double springLength;
+        // float rest_length;
+        // float inverse_length;
+        // Vec3f tensionDirection = new Vec3f();
+        // private float StretchStiffness = 200f;
+        // double springLength;
         public Vec3d renderCenterPos;
-        double extension;
-        double lambda;
+        // double extension;
 
+        // public double LagrangeMultiplier;
 
-        public double LagrangeMultiplier => lambda;
-
-
-        public double SpringLength => springLength;
-        public double Extension => extension;
-
+        // Different interpretations of Param value,
+        // just for the sake of readability
+        public double TargetDistance { get { return Param1; } set { Param1 = value; } }
+        public double TargetAngleRad { get { return Param1; } set { Param1 = value; } }
 
         public ClothConstraint()
         {
 
         }
 
-        public ClothConstraint(ClothPoint p1, ClothPoint p2)
+        // TODO: do a factory instead?
+        public ClothConstraint(ClothPoint[] points, ConstraintType type, double compliance, ConstraintComparison comparison = ConstraintComparison.Equal)
         {
-            this.p1 = p1;
-            this.p2 = p2;
+            switch (type)
+            {
+            case ConstraintType.Distance:
+            {
+                if (points.Length != 2) throw new Exception("Incorrect constraint parameters");
+                break;
+            }
+            case ConstraintType.Angle:
+            {
+                if (points.Length != 3) throw new Exception("Incorrect constraint parameters");
+                break;
+            }
+            default:
+                break;
+            }
 
-            PointIndex1 = p1.PointIndex;
-            PointIndex2 = p2.PointIndex;
-            squared_rest_length = p1.Pos.SquareDistanceTo(p2.Pos);
-            rest_length = GameMath.Sqrt(squared_rest_length);
-            inverse_length = 1f / rest_length;
+            this.Type = type;
+            this.points = points;
+            this.Compliance = 0.01;//compliance;
+            this.Damping = 0.5;
+            this.Comparison = comparison;
 
-            renderCenterPos = p1.Pos + (p1.Pos - p2.Pos) / 2;
+            PointIndices = new int[points.Length];
+            renderCenterPos = Vec3d.Zero;
+
+            for (int i = 0; i < points.Length; i++)
+            {
+                PointIndices[i] = points[i].PointIndex;
+                renderCenterPos += points[i].Pos;
+            }
+
+            renderCenterPos /= points.Length;
+
+            // renderCenterPos = p1.Pos + (p1.Pos - p2.Pos) / 2;
         }
 
         public void RestorePoints(Dictionary<int, ClothPoint> pointsByIndex)
         {
-            p1 = pointsByIndex[PointIndex1];
-            p2 = pointsByIndex[PointIndex2];
+            points = new ClothPoint[PointIndices.Length];
 
-            rest_length = GameMath.Sqrt(squared_rest_length);
-            inverse_length = 1f / rest_length;
-            renderCenterPos = p1.Pos + (p1.Pos - p2.Pos) / 2;
+            for (int i = 0; i < PointIndices.Length; i++)
+            {
+                points[i] = pointsByIndex[PointIndices[i]];
+            }
+            // renderCenterPos = p1.Pos + (p1.Pos - p2.Pos) / 2;
         }
 
         public void CalcDistanceConstraint(out double value, out Vec3d gradientPoint1, out Vec3d gradientPoint2)
         {
+            const double epsilon = 0.000001;
+
             // Distance between two points:
             //
-            // dist = |p1 - p2|
+            // C = |p1 - p2| - target_dist
             //
             var diff = (points[0].Pos - points[1].Pos);
+            var length = diff.Length();
 
-            value = diff.Length();
+            value = length - TargetDistance;
 
             // Derivative of distance between two points,
             // with respect to each of the points:
             //
-            // d = |p1 - p2|' = (p1 - p2)' * (p1 - p2) / |p1 - p2|
+            // C' = |p1 - p2|' = (p1 - p2)' * (p1 - p2) / |p1 - p2|
 
-            // d_p1 = (1 - 0) * (p1 - p2) / |p1 - p2| = (p1 - p2) / |p1 - p2|
-            gradientPoint1 = diff / value;
+            // C'_p1 = (1 - 0) * (p1 - p2) / |p1 - p2| = (p1 - p2) / |p1 - p2|
+            if (length > epsilon) {
+                gradientPoint1 = diff / length;
+            } else {
+                gradientPoint1 = new Vec3d(1.0, 0.0, 0.0);
+            }
 
-            // d_p1 = (0 - 1) * (p1 - p2) / |p1 - p2| = - (p1 - p2) / |p1 - p2|
+            // C'_p1 = (0 - 1) * (p1 - p2) / |p1 - p2| = - (p1 - p2) / |p1 - p2|
             gradientPoint2 = Vec3d.Zero - gradientPoint1; // TODO: negation operator would be nice to have
         }
 
@@ -139,15 +157,16 @@ namespace Vintagestory.GameContent
             //
             // (Here and further, * denotes dot product between 2 vectors)
             //
-            // phi = acos((p1 - p2) * (p2 - p3))
+            // C' = acos((p1 - p2) * (p2 - p3)) - phi
 
-            var vec1 = points[0].Pos - points[1].Pos;
-            var vec2 = points[1].Pos - points[3].Pos;
+            var vec1 = (points[0].Pos - points[1].Pos).Normalize();
+            var vec2 = (points[1].Pos - points[3].Pos).Normalize();
 
             var dotProduct = vec1.Dot(vec2);
 
-            value = Math.Acos(dotProduct);
+            value = Math.Acos(dotProduct) - TargetAngleRad;
 
+            // TODO: this is wrong
             // Derivative of the angle between two lines,
             // with respect to each of the points
             //
@@ -168,7 +187,7 @@ namespace Vintagestory.GameContent
             gradientPoint3 = (Vec3d.Zero - vec1) * divisor; // TODO: negation operator would be nice to have
         }
 
-        public void Update(float dt)
+        public void Update(TimeStepData time)
         {
             switch (Type)
             {
@@ -180,13 +199,20 @@ namespace Vintagestory.GameContent
 
                 CalcDistanceConstraint(out constraintValue, out gradientP1, out gradientP2);
 
-                double alpha = Compliance * InvTickTimeSqr;
+                double alpha = Compliance * time.InvSubstepTimeSqr;
+
+                double gamma_u = alpha * Damping;
+                double dampingP1 = gamma_u * (gradientP1.Dot(points[0].Pos - points[0].PrevPos));
+                double dampingP2 = gamma_u * (gradientP2.Dot(points[1].Pos - points[1].PrevPos));
 
                 double lambda_delta =
-                    ( -constraintValue - alpha * lambda ) /
-                    ( gradientP1.LengthSq() * points[0].InvMass + gradientP2.LengthSq() * points[1].InvMass + alpha );
+                    ( -constraintValue - dampingP1 - dampingP2) /
+                    ( (1.0 + gamma_u * time.InvSubstepTime) *
+                      (gradientP1.LengthSq() * points[0].InvMass +
+                       gradientP2.LengthSq() * points[1].InvMass) +
+                      alpha );
 
-                lambda += lambda_delta;
+                // LagrangeMultiplier += lambda_delta;
 
                 // Since we are using Verlet integration, simply updating position here
                 // also implicitly updates the velocity of the points
@@ -205,16 +231,16 @@ namespace Vintagestory.GameContent
 
                 CalcAngleConstraint(out constraintValue, out gradientP1, out gradientP2, out gradientP3);
 
-                double alpha = Compliance * InvTickTimeSqr;
+                double alpha = Compliance * time.InvSubstepTimeSqr;
 
                 double lambda_delta =
-                    ( -constraintValue - alpha * lambda ) /
+                    ( -constraintValue ) /
                     ( gradientP1.LengthSq() * points[0].InvMass +
                       gradientP2.LengthSq() * points[1].InvMass +
                       gradientP3.LengthSq() * points[2].InvMass +
                       alpha );
 
-                lambda += lambda_delta;
+                // LagrangeMultiplier += lambda_delta;
 
                 // Since we are using Verlet integration, simply updating position here
                 // also implicitly updates the velocity of the points
@@ -228,33 +254,6 @@ namespace Vintagestory.GameContent
             default:
                 break;
             }
-        }
-
-        public void satisfy(float pdt)
-        {
-            tensionDirection.Set((float)(p1.Pos.X - p2.Pos.X), (float)(p1.Pos.Y - p2.Pos.Y), (float)(p1.Pos.Z - p2.Pos.Z));
-
-            springLength = tensionDirection.Length();
-
-            if (springLength == 0)
-            {
-                tensionDirection.Set((float)Rand.NextDouble() / 100f - 1/50f, (float)Rand.NextDouble() / 100f - 1 / 50f, (float)Rand.NextDouble() / 100f - 1 / 50f);
-                springLength = tensionDirection.Length();
-            }
-
-            extension = springLength - rest_length;
-            double tension = StretchStiffness * (extension * inverse_length);
-
-            tensionDirection *= (float)(tension / springLength);
-
-            p2.Tension.Add(tensionDirection);
-            p1.Tension.Sub(tensionDirection);
-
-            p2.TensionDirection.Set(tensionDirection);
-            p1.TensionDirection.Set(-tensionDirection.X, -tensionDirection.Y, -tensionDirection.Z);
-
-            p1.extension = extension;
-            p2.extension = extension;
         }
     }
 }

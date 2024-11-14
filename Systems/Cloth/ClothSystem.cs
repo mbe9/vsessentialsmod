@@ -6,6 +6,7 @@ using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
+using Vintagestory.API.Datastructures;
 
 namespace Vintagestory.GameContent
 {
@@ -23,12 +24,37 @@ namespace Vintagestory.GameContent
         public List<ClothPoint> Points = new List<ClothPoint>();
     }
 
+    public class TimeStepData
+    {
+        public double StepTime;
+        public double InvStepTime;
+        public double InvStepTimeSqr;
+
+        public double SubstepTime;
+        public double InvSubstepTime;
+        public double InvSubstepTimeSqr;
+
+        public TimeStepData(double tickTime, int substepCount)
+        {
+            this.StepTime = tickTime;
+            this.InvStepTime = 1.0 / tickTime;
+            this.InvStepTimeSqr = 1.0 / (tickTime * tickTime);
+
+            this.SubstepTime = tickTime / substepCount;
+            this.InvSubstepTime = 1.0 / (tickTime * substepCount);
+            this.InvSubstepTimeSqr = 1.0 / (tickTime * tickTime * substepCount * substepCount);
+        }
+    }
+
 
     // How to synchronize this over the network?
     // Idea: We run the simulation client and server, but server 
     [ProtoContract]
     public class ClothSystem
     {
+        const int IterationCount = 1;
+        public const int SubstepCount = 1000;
+
         [ProtoMember(1)]
         public int ClothId;
         [ProtoMember(2)]
@@ -54,6 +80,8 @@ namespace Vintagestory.GameContent
         public ICoreAPI api;        
         public Vec3d windSpeed = new Vec3d();
         public ParticlePhysics pp;
+        public IBlockAccessor BlockAccess;
+        protected TimeStepData timeStepData;
         protected NormalizedSimplexNoise noiseGen;
         protected float[] tmpMat = new float[16];
         protected Vec3f distToCam = new Vec3f();
@@ -80,7 +108,8 @@ namespace Vintagestory.GameContent
             }
         }
 
-        public double MaxExtension => Constraints.Count == 0 ? 0 : Constraints.Max(c => c.Extension);
+        // FIXME
+        public double MaxExtension => 0;//Constraints.Count == 0 ? 0 : Constraints.Max(c => c.Extension);
 
         public Vec3d CenterPosition
         {
@@ -170,7 +199,11 @@ namespace Vintagestory.GameContent
 
                     ClothPoint p1 = plist.Points[0];
                     ClothPoint p2 = plist.Points[1];
-                    var constraint = new ClothConstraint(p1, p2);
+
+                    var points = new ClothPoint[2] {p1, p2};
+
+                    var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
+                    constraint.TargetDistance = Resolution;
                     Constraints.Add(constraint);
                 }
             }
@@ -210,7 +243,10 @@ namespace Vintagestory.GameContent
 
             var dir = end - start;
 
-            if (clothType == EnumClothType.Rope) {
+            switch (clothType)
+            {
+            case EnumClothType.Rope:
+            {
                 double len = dir.Length();
 
                 var plist = new PointList();
@@ -229,13 +265,17 @@ namespace Vintagestory.GameContent
                         ClothPoint p1 = plist.Points[i - 1];
                         ClothPoint p2 = plist.Points[i];
 
-                        var constraint = new ClothConstraint(p1, p2);
+                        var points = new ClothPoint[2] {p1, p2};
+
+                        var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
+                        constraint.TargetDistance = (p1.Pos - p2.Pos).Length();
                         Constraints.Add(constraint);
                     }
                 }
+                break;
             }
 
-            if (clothType == EnumClothType.Cloth)
+            case EnumClothType.Cloth:
             {
                 double hlen = (end - start).HorLength();
                 double vlen = Math.Abs(end.Y - start.Y);
@@ -263,7 +303,10 @@ namespace Vintagestory.GameContent
                             ClothPoint p1 = Points2d[a - 1].Points[y];
                             ClothPoint p2 = Points2d[a].Points[y];
 
-                            var constraint = new ClothConstraint(p1, p2);
+                            var points = new ClothPoint[2] {p1, p2};
+
+                            var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
+                            constraint.TargetDistance = Resolution;
                             Constraints.Add(constraint);
                         }
 
@@ -273,11 +316,16 @@ namespace Vintagestory.GameContent
                             ClothPoint p1 = Points2d[a].Points[y - 1];
                             ClothPoint p2 = Points2d[a].Points[y];
 
-                            var constraint = new ClothConstraint(p1, p2);
+                            var points = new ClothPoint[2] {p1, p2};
+
+                            var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
+                            constraint.TargetDistance = Resolution;
                             Constraints.Add(constraint);
                         }
                     }
                 }
+                break;
+            }
             }
         }
 
@@ -317,6 +365,8 @@ namespace Vintagestory.GameContent
             this.api = api;
             this.capi = api as ICoreClientAPI;
             pp = cm.partPhysics;
+            this.BlockAccess = pp.BlockAccess;
+            this.timeStepData = new TimeStepData(pp.PhysicsTickTime, SubstepCount);
 
             noiseGen = NormalizedSimplexNoise.FromDefaultOctaves(4, 100, 0.9, api.World.Seed + CenterPosition.GetHashCode());
         }
@@ -482,38 +532,178 @@ namespace Vintagestory.GameContent
 
         }
 
-        float accum = 0f;
+        double accum_substep = 0f;
+        int accum_step = 0;
+
         public void updateFixedStep(float dt)
         {
-            accum += dt;
-            if (accum > 1) accum = 0.25f;
+            accum_substep += dt;
+            if (accum_substep > 1) accum_substep = 0.25f;
 
-            float step = pp.PhysicsTickTime;
-
-            while (accum >= step)
+            while (accum_substep >= timeStepData.SubstepTime)
             {
-                accum -= step;
-                tickNow(step);
-            }
-        }
+                accum_substep -= timeStepData.SubstepTime;
+                accum_step += 1;
 
-        void tickNow(float pdt) {
-            // make sure all the constraints are satisfied.
-            for (int i = Constraints.Count - 1; i >= 0; i--)
-            {
-                Constraints[i].satisfy(pdt);
-            }
-
-            // move each point with a pull from gravity
-            for (int i = Points2d.Count-1; i >= 0; i--)
-            {
-                for (int j = Points2d[i].Points.Count-1; j >= 0; j--)
+                if (accum_step >= SubstepCount)
                 {
-                    Points2d[i].Points[j].update(pdt, api.World);
+                    substepNow(true, 1.0);
+                    accum_step = 0;
+                }
+                else
+                {
+                    substepNow(false, (double)accum_step / SubstepCount);
+
                 }
             }
         }
 
+        CachedCuboidList CollisionBoxList = new CachedCuboidList();
+        Cuboidd particleCollBox = new Cuboidd();
+        Cuboidd blockCollBox = new Cuboidd();
+        BlockPos minPos = new BlockPos();
+        BlockPos maxPos = new BlockPos();
+
+        void substepNow(bool isFullStep, double stepRatio)
+        {
+            for (int i = 0; i < Points2d.Count; i++)
+            {
+                for (int j = 0; j < Points2d[i].Points.Count; j++)
+                {
+                    Points2d[i].Points[j].substepUpdate(timeStepData, stepRatio);
+
+                    if (isFullStep) {
+                        Points2d[i].Points[j].stepUpdate(timeStepData, api.World);
+                    }
+                }
+            }
+
+            for (int k = 0; k < IterationCount; k++)
+            {
+                for (int i = 0; i < Constraints.Count; i++)
+                {
+                    var constraint = Constraints[i];
+
+                    constraint.Update(timeStepData);
+                }
+
+                double size = 0.1;
+                {
+                    int pointIdx = 0;
+
+                    // Handle collision constraints
+                    for (int i = 0; i < Points2d.Count; i++)
+                    {
+                        for (int j = 0; j < Points2d[i].Points.Count; j++)
+                        {
+                            var p = Points2d[i].Points[j];
+
+                            minPos.SetAndCorrectDimension(
+                                (int)(p.Pos.X - size / 2),
+                                (int)(p.Pos.Y - size / 2), // -1 for the extra high collision box of fences
+                                (int)(p.Pos.Z - size / 2)
+                            );
+
+                            maxPos.SetAndCorrectDimension(
+                                (int)(p.Pos.X + size / 2),
+                                (int)(p.Pos.Y + size / 2),
+                                (int)(p.Pos.Z + size / 2)
+                            );
+
+                            BlockAccess.WalkBlocks(minPos, maxPos, (cblock, x, y, z) => {
+                                Cuboidf[] collisionBoxes = cblock.GetCollisionBoxes(BlockAccess, new BlockPos());
+
+                                if (collisionBoxes != null)
+                                {
+                                    for (var c = 0; c < collisionBoxes.Count(); c++) {
+                                        var collBox = collisionBoxes[c];
+
+                                        if (collBox == null) continue;
+
+                                        blockCollBox.SetAndTranslate(collBox, x, y, z);
+                                        blockCollBox.GrowBy(size / 2, size / 2, size / 2);
+
+                                        double constraintValue = 0;
+                                        Vec3d gradient;
+
+                                        CalcCollisionConstraint(p.Pos, blockCollBox, out constraintValue, out gradient);
+
+                                        UpdatePointOnCollision(p, constraintValue, gradient);
+                                    }
+                                }
+
+                            }, false);
+
+                            pointIdx++;
+                        }
+                    }
+                }
+            }
+
+
+            // CollisionBoxList.Clear();
+            //
+
+
+
+        }
+
+        public void CalcCollisionConstraint(Vec3d pos, Cuboidd coll, out double value, out Vec3d gradient)
+        {
+            const double epsilon = 0.000001;
+
+            var collCenter = new Vec3d(
+                (coll.MaxX + coll.MinX) / 2.0,
+                (coll.MaxY + coll.MinY) / 2.0,
+                (coll.MaxZ + coll.MinZ) / 2.0
+            );
+
+            double dx = (pos.X - collCenter.X);
+            double dy = (pos.Y - collCenter.Y);
+            double dz = (pos.Z - collCenter.Z);
+
+            double abs_dx = Math.Abs(dx);
+            double abs_dy = Math.Abs(dy);
+            double abs_dz = Math.Abs(dz);
+
+            double vx = abs_dx - coll.Width / 2.0;
+            double vy = abs_dy - coll.Height / 2.0;
+            double vz = abs_dz - coll.Length / 2.0;
+
+            if (vx >= vy && vx >= vz)
+            {
+                value = vx;
+                if (abs_dx > epsilon) gradient = new Vec3d(Math.Sign(dx), 0, 0);
+                else gradient = new Vec3d(1, 0, 0);
+            }
+            else if (vy >= vx && vy >= vz)
+            {
+                value = vy;
+                if (abs_dy > epsilon) gradient = new Vec3d(0.0, Math.Sign(dy), 0.0);
+                else gradient = new Vec3d(0, 1, 0);
+            }
+            else
+            {
+                value = vz;
+                if (abs_dz > epsilon) gradient = new Vec3d(0, 0, Math.Sign(dz));
+                else gradient = new Vec3d(0, 0, 1);
+            }
+        }
+
+        public void UpdatePointOnCollision(ClothPoint point, double constraintValue, Vec3d constraintGradient)
+        {
+            const double epsilon = 0.000001;
+
+            if (constraintValue > 0.0 || point.InvMass < epsilon) return;
+
+            double alpha = 0.0 * timeStepData.InvSubstepTimeSqr;
+            double lambda_delta =
+                ( -constraintValue ) /
+                ( constraintGradient.LengthSq() * point.InvMass +
+                  alpha );
+
+            point.Pos += point.InvMass * constraintGradient * lambda_delta;
+        }
 
         public void slowTick3s()
         {
