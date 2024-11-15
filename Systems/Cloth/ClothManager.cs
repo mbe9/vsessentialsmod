@@ -10,25 +10,31 @@ using Vintagestory.API.Util;
 
 namespace Vintagestory.GameContent
 {
-    [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
+    [ProtoContract]
     public class UnregisterClothSystemPacket
     {
+        [ProtoMember(1)]
         public int[] ClothIds;
     }
 
-    [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
+    [ProtoContract]
     public class ClothSystemPacket
     {
+        [ProtoMember(1)]
         public ClothSystem[] ClothSystems;
     }
 
-    [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
+    [ProtoContract]
     public class ClothPointPacket
     {
+        [ProtoMember(1)]
         public int ClothId;
-        public int PointX;
-        public int PointY;
+        [ProtoMember(2)]
+        public int PointId;
+        [ProtoMember(3)]
         public ClothPoint Point;
+        [ProtoMember(4)]
+        public ClothPointData PointData;
     }
 
     public class ClothManager : ModSystem, IRenderer
@@ -156,36 +162,37 @@ namespace Vintagestory.GameContent
 
                 if (clothSystems.Count > 0)
                 {
-                    float maxext = -1;
+                    float max = -1;
                     ClothSystem maxcs = null;
-                    float stretchWarn =0.4f;
 
                     foreach (var val in clothSystems)
                     {
                         var cs = val.Value;
-                        if (cs.MaxExtension > cs.StretchWarn)
+                        (float maxForce, ClothPoint pt) = cs.MaxForce;
+
+                        if (maxForce > cs.ForceWarn)
                         {
                             cs.secondsOverStretched += dt;
-                        } else
+                        }
+                        else
                         {
                             cs.secondsOverStretched = 0;
                         }
 
-                        if (cs.MaxExtension > maxext)
+                        if (maxForce > max)
                         {
-                            maxext = (float)cs.MaxExtension;
+                            max = maxForce;
                             maxcs = cs;
-                            stretchWarn = cs.StretchWarn;
-                        }  
+                        }
                     }
 
-                    if (maxext > stretchWarn && maxcs.secondsOverStretched > 0.2)
+                    if (maxcs != null && max > maxcs.ForceWarn && maxcs.secondsOverStretched > 0.2)
                     {
-                        float intensity = 10 * (float)(maxext - stretchWarn);
+                        float intensity = ((max - maxcs.ForceWarn) / (maxcs.ForceRip - maxcs.ForceWarn));
 
                         if (!stretchSound.IsPlaying) stretchSound.Start();
                         stretchSound.SetPosition((float)maxcs.CenterPosition.X, (float)maxcs.CenterPosition.Y, (float)maxcs.CenterPosition.Z);
-                        stretchSound.SetVolume(GameMath.Clamp((float)intensity, 0.5f, 1f));
+                        stretchSound.SetVolume(GameMath.Clamp(intensity, 0.1f, 1f));
                         stretchSound.SetPitch((float)GameMath.Clamp(intensity + 0.7f, 0.7f, 1.2f));
                     }
                     else
@@ -263,7 +270,7 @@ namespace Vintagestory.GameContent
                         cs.CollectDirtyPoints(packets);
 
                         // Overextended -> Rip it apart
-                        if (cs.MaxExtension > cs.StretchRip)
+                        if (cs.MaxExtension > cs.ForceRip)
                         {
                             cs.secondsOverStretched += 0.1f;
 

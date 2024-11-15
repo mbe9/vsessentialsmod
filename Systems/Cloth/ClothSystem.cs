@@ -2,14 +2,23 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
+using Vintagestory.API.Config;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Datastructures;
+using System.Runtime.CompilerServices;
 
 namespace Vintagestory.GameContent
 {
+    using AngleConstraint = SoftBody.AngleConstraint;
+    using DistanceConstraint = SoftBody.DistanceConstraint;
+    using LengthConstraint = SoftBody.LengthConstraint;
+    using LineSegemntCollisionConstraint = SoftBody.LineSegemntCollisionConstraint;
+    using ConstraintComparison = SoftBody.ConstraintComparison;
+
     [ProtoContract]
     public enum EnumClothType
     {
@@ -18,10 +27,20 @@ namespace Vintagestory.GameContent
     }
 
     [ProtoContract]
-    public class PointList 
+    public class ClothPointPacketXAxis
     {
-        [ProtoMember(1)]
-        public List<ClothPoint> Points = new List<ClothPoint>();
+        public struct Offset
+        {
+            public ushort PointOffset;
+            public byte PointIdx;
+        }
+
+        public double AnchorPosX;
+        public double OffsetMult;
+
+        public Offset[] pointOffsets;
+
+        public ushort FrameNum;
     }
 
     public class TimeStepData
@@ -52,18 +71,65 @@ namespace Vintagestory.GameContent
     [ProtoContract]
     public class ClothSystem
     {
-        const int IterationCount = 1;
-        public const int SubstepCount = 1000;
+        public const double DistMult = 0.001;
+        const int MinSegmentCount = 2;
+        const int MaxSegmentCount = 64;
+        const ushort RopeSegmentLength = 500;
+        const ushort MinRopeLength = RopeSegmentLength * MinSegmentCount;
+        const ushort MaxRopeLength = RopeSegmentLength * MaxSegmentCount;
+
+        public const int SubstepCount = 100;
+
+        const ushort MinBufferSize = MinSegmentCount + 1;
+        const ushort MaxBufferSize = MaxSegmentCount + 1;
+
+        ushort RopeLength = 0;
+        float RopeWidth = 0.1f;
+
+        [ProtoMember(5)]
+        float DistanceCompliance = 10000;
+        float DistanceDamping = 0;
+
+        float AngleCompliance = 10000;
+        float AngleDamping = 0;
+        float AngleTarget = 0;
+
+        float LengthCompliance = 1000;
+        float LengthDamping = 0;
+
+        ushort bufferHead = 0;
+        ushort bufferSize = 0;
+
+        ushort bufferFirst => bufferHead;
+
+        ushort bufferLastPoint => (ushort)((bufferHead + bufferSize - 1) % MaxBufferSize);
+        ushort bufferLastDist => (ushort)((bufferHead + bufferSize - 2) % MaxBufferSize);
+        ushort bufferLastAngle => (ushort)((bufferHead + bufferSize - 3) % MaxBufferSize);
+
+        ushort bufferEmptyRightPoint => (ushort)((bufferHead + bufferSize) % MaxBufferSize);
+        ushort bufferEmptyRightDist => (ushort)((bufferHead + bufferSize - 1) % MaxBufferSize);
+        ushort bufferEmptyRightAngle => (ushort)((bufferHead + bufferSize - 2) % MaxBufferSize);
+        ushort bufferEmptyLeft => (ushort)((bufferHead + MaxBufferSize - 1) % MaxBufferSize);
 
         [ProtoMember(1)]
         public int ClothId;
         [ProtoMember(2)]
         EnumClothType clothType;
+
+        ClothPoint[] Points = new ClothPoint[MaxBufferSize];
+        public ClothPointData[] PointsData = new ClothPointData[MaxBufferSize];
+
+        DistanceConstraint[] DistanceConstraints = new DistanceConstraint[MaxBufferSize];
+        ushort[] SegmentDistances = new ushort[MaxBufferSize];
+
+        AngleConstraint[] AngleConstraints = new AngleConstraint[MaxBufferSize];
+        FastVec3f[] Forces = new FastVec3f[MaxBufferSize];
+
+        List<LineSegemntCollisionConstraint> CollisionConstraints = new ();
+
         [ProtoMember(3)]
-        List<PointList> Points2d = new List<PointList>();
+        public ClothPinStorage PinStorage = new();
         [ProtoMember(4)]
-        List<ClothConstraint> Constraints = new List<ClothConstraint>();
-        [ProtoMember(5)]
         public bool Active { get; set; }
 
         /// <summary>
@@ -71,15 +137,13 @@ namespace Vintagestory.GameContent
         /// </summary>
         public static float Resolution = 2;
 
-        public float StretchWarn = 0.6f;
-        public float StretchRip = 0.75f;
+        public float ForceWarn = 1000.0f;
+        public float ForceRip = 2000.0f;
 
         public bool LineDebug=false;
-        public bool boyant = false;
         protected ICoreClientAPI capi;
         public ICoreAPI api;        
         public Vec3d windSpeed = new Vec3d();
-        public ParticlePhysics pp;
         public IBlockAccessor BlockAccess;
         protected TimeStepData timeStepData;
         protected NormalizedSimplexNoise noiseGen;
@@ -92,67 +156,70 @@ namespace Vintagestory.GameContent
         public float secondsOverStretched;
 
 
-        public bool PinnedAnywhere
-        {
-            get
-            {
-                foreach (var pointlist in Points2d)
-                {
-                    foreach (var point in pointlist.Points)
-                    {
-                        if (point.Pinned) return true;
-                    }
-                }
-
-                return false;
-            }
-        }
+        public bool PinnedAnywhere => PinStorage.Count > 0;
 
         // FIXME
         public double MaxExtension => 0;//Constraints.Count == 0 ? 0 : Constraints.Max(c => c.Extension);
+
+        public (float, ClothPoint) MaxForce
+        {
+            get
+            {
+                float maxForceSqr = 0;
+                ClothPoint maxForcePoint = null;
+
+                for (int i = 0; i < bufferSize; i++)
+                {
+                    int idx = (bufferHead + i) % MaxBufferSize;
+
+                    ref var force = ref Forces[idx];
+                    ref var point = ref Points[idx];
+
+                    float forceSqr = force.LengthSq();
+
+                    if (forceSqr > maxForceSqr)
+                    {
+                        maxForceSqr = forceSqr;
+                        maxForcePoint = point;
+                    }
+                }
+
+                return ((float)Math.Sqrt(maxForceSqr), maxForcePoint);
+            }
+        }
 
         public Vec3d CenterPosition
         {
             get
             {
-                // Loop twice to not loose decimal precision
+                if (bufferSize == 0) return Vec3d.Zero;
 
                 Vec3d pos = new Vec3d();
-                int cnt = 0;
-                foreach (var pointlist in Points2d)
-                {
-                    foreach (var point in pointlist.Points)
-                    {
-                        cnt++;
-                    }
-                }
 
-                foreach (var pointlist in Points2d)
+                double mult = 1.0 / (double)bufferSize;
+
+                for (int i = 0; i < bufferSize; i++)
                 {
-                    foreach (var point in pointlist.Points)
-                    {
-                        pos.Add(point.Pos.X / cnt, point.Pos.Y / cnt, point.Pos.Z / cnt);
-                    }
+                    int idx = (bufferHead + i) % MaxBufferSize;
+
+                    ref var point = ref PointsData[idx];
+
+                    pos.Add(point.Pos.X * mult, point.Pos.Y * mult, point.Pos.Z * mult);
                 }
 
                 return pos;
             }
         }
 
-        public ClothPoint FirstPoint => Points2d[0].Points[0];
-        public ClothPoint LastPoint
-        {
-            get
-            {
-                var points = Points2d[Points2d.Count - 1].Points;
-                return points[points.Count - 1];
-            }
-        }
+        public int SegmentCount => ((bufferSize - 1) >= 0) ? (bufferSize - 1) : 0;
+
+        public ClothPoint FirstPoint => Points[bufferFirst];
+        public ClothPoint LastPoint => Points[bufferLastPoint];
 
         public ClothPoint[] Ends => new ClothPoint[] { FirstPoint, LastPoint };
 
-        public int Width => Points2d.Count;
-        public int Length => Points2d[0].Points.Count;
+        // public int Width => Points2d.Count;
+        // public int Length => Points2d[0].Points.Count;
 
 
         public static ClothSystem CreateCloth(ICoreAPI api, ClothManager cm, Vec3d start, Vec3d end)
@@ -168,69 +235,258 @@ namespace Vintagestory.GameContent
 
         private ClothSystem() { }
 
-        double minLen = 1;
-        double maxLen = 10;
-
-        public bool ChangeRopeLength(double len)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        ushort nextIdx(ushort idx, ushort offset)
         {
-            var plist = Points2d[0];
+            return (ushort)((idx + offset) % MaxBufferSize);
+        }
 
-            double currentLength = plist.Points.Count / Resolution;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        ushort prevIdx(ushort idx, ushort offset)
+        {
+            return (ushort)((idx + MaxBufferSize - offset) % MaxBufferSize);
+        }
 
-            bool isAdd = len > 0;
+        void RecalculateRopeLength()
+        {
+            RopeLength = 0;
 
-            if (isAdd && len + currentLength > maxLen) return false;
-            if (!isAdd && len + currentLength < minLen) return false;
-
-            int pointIndex = plist.Points.Max(p => p.PointIndex)+1;
-            var fp = FirstPoint;
-            var pine = fp.PinnedToEntity;
-            var pinb = fp.PinnedToBlockPos;
-            var pino = fp.pinnedToOffset;
-            fp.UnPin();
-            float step = 1 / Resolution;
-            int totalPoints = Math.Abs((int)(len * Resolution));
-
-            if (isAdd)
+            for (int i = 0; i < bufferSize - 1; i++)
             {
-                for (int i = 0; i <= totalPoints; i++)
+                int index = (bufferHead + i) % MaxBufferSize;
+
+                RopeLength += DistanceConstraints[index].TargetDistance;
+            }
+        }
+
+        public ushort IncreaseRopeLength(ClothPoint point, ushort changeLength)
+        {
+            // Limit change value by max rope length
+            if ((MaxRopeLength < changeLength) || (MaxRopeLength - changeLength < RopeLength))
+            {
+                changeLength = MaxRopeLength - RopeLength;
+            }
+
+            ushort remainingLength = changeLength;
+
+            // Changing length at the start of the rope
+            if (point.InternalIndex == bufferHead)
+            {
                 {
-                    plist.Points.Insert(0, new ClothPoint(this, pointIndex++, fp.Pos.X + step*(i+1), fp.Pos.Y, fp.Pos.Z));
+                    ushort addLength = changeLength;
 
-                    ClothPoint p1 = plist.Points[0];
-                    ClothPoint p2 = plist.Points[1];
+                    if (RopeSegmentLength - SegmentDistances[bufferFirst] < addLength)
+                    {
+                        addLength = RopeSegmentLength - SegmentDistances[bufferFirst];
+                    }
 
-                    var points = new ClothPoint[2] {p1, p2};
+                    SegmentDistances[bufferFirst] += addLength;
+                    remainingLength -= addLength;
+                }
 
-                    var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
-                    constraint.TargetDistance = Resolution;
-                    Constraints.Add(constraint);
+                while (remaingingLength > 0)
+                {
+                    if (bufferSize == MaxBufferSize)
+                    {
+                        break;
+                    }
+
+                    bufferHead = bufferEmptyLeft;
+                    bufferSize += 1;
+
+                    ushort addLength = Math.Min(remainingLength, RopeSegmentLength);
+
+                    SegmentDistances[bufferHead] = addLength;
+                    remainingLength -= addLength;
+
+                    DistanceConstraints[bufferHead].PointIndex1 = bufferHead;
+                    DistanceConstraints[bufferHead].PointIndex2 = nextIdx(bufferHead, 1);
+                    DistanceConstraints[bufferHead].Comparison = ConstraintComparison.Equal;
+
+                    if (bufferSize >= 3)
+                    {
+                        AngleConstraints[bufferHead] = new AngleConstraint {
+                            TargetAngleCos = AngleTarget,
+                            PointIndex1 = bufferHead,
+                            PointIndex2 = nextIdx(bufferHead, 1),
+                            PointIndex3 = nextIdx(bufferHead, 2),
+                            Comparison = ConstraintComparison.Equal,
+                        };
+                    }
+
+                    ushort secondIdx = nextIdx(bufferHead, 1);
+
+                    Points[bufferHead] = Points[secondIdx];
+                    Points[bufferHead].InternalIndex = bufferHead;
+                    Points[secondIdx] = new ClothPoint(this, secondIdx);
+
+                    PointsData[bufferHead] = PointsData[secondIdx];
+                    PointsData[secondIdx] = new ClothPointData {
+                        Pos = PointsData[bufferHead].Pos,
+                        PrevPos = PointsData[bufferHead].PrevPos,
+                        InvMass = PointsData[bufferHead].InvMass,
+                    };
+                }
+            }
+            // Changing length at the end of the rope
+            else if (point.InternalIndex == bufferLastPoint)
+            {
+                {
+                    ushort addLength = changeLength;
+
+                    if (RopeSegmentLength - SegmentDistances[bufferLastDist] < addLength)
+                    {
+                        addLength = RopeSegmentLength - SegmentDistances[bufferLastDist];
+                    }
+
+                    SegmentDistances[bufferLastDist] += addLength;
+                    remainingLength -= addLength;
+                }
+
+                while (remainingLength > 0)
+                {
+                    if (bufferSize == MaxBufferSize)
+                    {
+                        break;
+                    }
+
+                    bufferSize += 1;
+
+                    ushort addLength = Math.Min(remainingLength, RopeSegmentLength);
+
+                    SegmentDistances[bufferLastDist] = addLength;
+                    remainingLength -= addLength;
+
+                    DistanceConstraints[bufferLastDist].PointIndex1 = prevIdx(bufferLastPoint, 1);
+                    DistanceConstraints[bufferLastDist].PointIndex2 = bufferLastPoint;
+                    DistanceConstraints[bufferLastDist].Comparison = Comparison.Equals;
+
+                    if (bufferSize >= 3)
+                    {
+                        AngleConstraints[bufferLastAngle] = new AngleConstraint {
+                            TargetAngleCos = AngleTarget,
+                            PointIndex1 = prevIdx(bufferLastPoint, 2),
+                            PointIndex2 = prevIdx(bufferLastPoint, 1),
+                            PointIndex3 = bufferLastPoint,
+                            Comparison = ConstraintComparison.Equal,
+                        };
+                    }
+
+                    ushort secondIdx = prevIdx(bufferLastPoint, 1);
+
+                    Points[bufferLastPoint] = Points[secondIdx];
+                    Points[bufferLastPoint].InternalIndex = bufferLastPoint;
+                    Points[secondIdx] = new ClothPoint(this, secondIdx);
+
+                    PointsData[bufferLastPoint] = PointsData[secondIdx];
+                    PointsData[secondIdx] = new ClothPointData {
+                        Pos = PointsData[bufferLastPoint].Pos;
+                        PrevPos = PointsData[bufferLastPoint].PrevPos;
+                        InvMass = PointsData[bufferLastPoint].InvMass;
+                    };
                 }
             }
             else
             {
-                for (int i = 0; i <= totalPoints; i++)
+                // Disallow changing length on any of the other points,
+                // because it would insanely complicate both game mechanics and the code
+                return 0;
+            }
+
+            ushort changeLength = changeLength - remainingLength;
+            RopeLength += changeLength;
+
+            genDebugMesh();
+
+            return changeLength;
+        }
+
+        public ushort ReduceRopeLength(ClothPoint point, ushort changeLength)
+        {
+            // Limit change value by min rope length
+            if (changeLength > RopeLength - MinRopeLength)
+            {
+                changeLength = RopeLength - MinRopeLength;
+            }
+
+            ushort remainingLength = changeLength;
+
+            // Changing length at the start of the rope
+            if (point.InternalIndex == bufferHead)
+            {
+                while (remainingLength > 0)
                 {
-                    var point = plist.Points[0];
-                    plist.Points.RemoveAt(0);
-                        
-                    for (int k = 0; k < Constraints.Count; k++)
+                    if (SegmentDistances[bufferFirst] < remainingLength)
                     {
-                        var c = Constraints[k];
-                        if (c.Point1 == point || c.Point2 == point)
+                        remainingLength -= SegmentDistances[bufferFirst];
+
+                        if (bufferSize == MinBufferSize)
                         {
-                            Constraints.RemoveAt(k);
-                            k--;
+                            break;
                         }
+
+                        bufferHead = nextIdx(bufferHead, 1);
+                        bufferSize -= 1;
+
+                        // Remove any pins on points we removing
+                        Points[bufferHead].UnPin();
+
+                        Points[bufferHead] = Points[prevIdx(bufferHead, 1)];
+                        Points[bufferHead].InternalIndex = bufferHead;
+                        Points[prevIdx(bufferHead, 1)] = null;
+                    }
+                    else
+                    {
+                        SegmentDistances[bufferFirst] -= removeLength;
+                        remainingLength -= removeLength;
+                        break;
                     }
                 }
             }
+            // Changing length at the end of the rope
+            else if (point.InternalIndex == bufferLastPoint)
+            {
+                while (remainingLength > 0)
+                {
+                    if (SegmentDistances[bufferLastDist] < remainingLength)
+                    {
+                        remainingLength -= SegmentDistances[bufferLastDist];
 
-            if (pine != null) FirstPoint.PinTo(pine, pino);
-            if (pinb != null) FirstPoint.PinTo(pinb, pino);
+                        if (bufferSize == MinBufferSize)
+                        {
+                            break;
+                        }
+
+                        bufferSize -= 1;
+
+                        // Remove any pins on points we removing
+                        Points[bufferLastPoint].UnPin();
+
+                        Points[bufferLastPoint] = Points[nextIdx(bufferLastPoint, 1)];
+                        Points[bufferLastPoint].InternalIndex = bufferHead;
+                        Points[nextIdx(bufferLastPoint, 1)] = null;
+                    }
+                    else
+                    {
+                        SegmentDistances[bufferLastDist] -= removeLength;
+                        remainingLength -= removeLength;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                // Disallow changing length on any of the other points,
+                // because it would insanely complicate both game mechanics and the code
+                return 0;
+            }
+
+            ushort changeLength = changeLength - remainingLength;
+            RopeLength -= changeLength;
+
             genDebugMesh();
 
-            return true;
+            return changeLength;
         }
 
         private ClothSystem(ICoreAPI api, ClothManager cm, Vec3d start, Vec3d end, EnumClothType clothType, AssetLocation ropeSectionModel = null)
@@ -238,94 +494,133 @@ namespace Vintagestory.GameContent
             this.clothType = clothType;
             this.ropeSectionModel = ropeSectionModel;
 
-            Init(api, cm);            
-            float step = 1 / Resolution;
+            Init(api, cm);
 
-            var dir = end - start;
+            var delta = end - start;
+            double length = delta.Length();
 
-            switch (clothType)
+            if (length < MinRopeLength)
             {
-            case EnumClothType.Rope:
-            {
-                double len = dir.Length();
+                // TODO: this solution is kinda hardcoded and works only for MinSegmentCount = 2
+                bufferHead = 0;
+                bufferSize = 3;
 
-                var plist = new PointList();
-                Points2d.Add(plist);
+                Points[bufferHead] = new ClothPoint(this, bufferHead);
+                PointsData[bufferHead] = new ClothPointData(start, start, 1.0); // TODO mass
 
-                int totalPoints = (int)(len * Resolution);
+                var pos = start + (end - start) * 0.5;
+                Points[nextIdx(bufferHead, 1)] = new ClothPoint(this, nextIdx(bufferHead, 1));
+                PointsData[nextIdx(bufferHead, 1)] = new ClothPointData(pos, pos, 1.0); // TODO mass
 
-                for (int i = 0; i <= totalPoints; i++)
-                {
-                    var t = (float)i / totalPoints;
+                Points[nextIdx(bufferHead, 2)] = new ClothPoint(this, nextIdx(bufferHead, 2));
+                PointsData[nextIdx(bufferHead, 2)] = new ClothPointData(end, end, 1.0); // TODO mass
 
-                    plist.Points.Add(new ClothPoint(this, i, start.X + dir.X * t, start.Y + dir.Y * t, start.Z + dir.Z * t));
+                DistanceConstraints[bufferHead] = new DistanceConstraint {
+                    TargetDistance = RopeSegmentLength,
+                    Compliance = DistanceCompliance,
+                    Damping = DistanceDamping,
+                    PointIndex1 = bufferHead,
+                    PointIndex2 = nextIdx(bufferHead, 1),
+                    Comparison = ConstraintComparison.Equal,
+                };
 
-                    if (i > 0)
-                    {
-                        ClothPoint p1 = plist.Points[i - 1];
-                        ClothPoint p2 = plist.Points[i];
+                DistanceConstraints[nextIdx(bufferHead, 1)] = new DistanceConstraint {
+                    TargetDistance = RopeSegmentLength,
+                    Compliance = DistanceCompliance,
+                    Damping = DistanceDamping,
+                    PointIndex1 = nextIdx(bufferHead, 1),
+                    PointIndex2 = nextIdx(bufferHead, 2),
+                    Comparison = ConstraintComparison.Equal,
+                };
 
-                        var points = new ClothPoint[2] {p1, p2};
+                AngleConstraints[bufferHead] = new AngleConstraint {
+                    TargetAngleCos = AngleTarget,
+                    Compliance = AngleCompliance,
+                    Damping = AngleDamping,
+                    PointIndex1 = bufferHead,
+                    PointIndex2 = nextIdx(bufferHead, 1),
+                    PointIndex3 = nextIdx(bufferHead, 2),
+                    Comparison = ConstraintComparison.Equal,
+                };
 
-                        var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
-                        constraint.TargetDistance = (p1.Pos - p2.Pos).Length();
-                        Constraints.Add(constraint);
-                    }
-                }
-                break;
+                RopeLength = MinRopeLength;
             }
-
-            case EnumClothType.Cloth:
+            else
             {
-                double hlen = (end - start).HorLength();
-                double vlen = Math.Abs(end.Y - start.Y);
+                double remLength = length;
 
-                int hleni = (int)(hlen * Resolution);
-                int vleni = (int)(vlen * Resolution);
-                int totalPoints = hleni * vleni;
+                bufferHead = 0;
+                bufferSize = 0;
 
-                int index = 0;
-
-                for (int a = 0; a < hleni; a++)
+                while (remLength > RopeSegmentLength)
                 {
-                    Points2d.Add(new PointList());
+                    double t = 1.0 - remLength / length;
+                    var pos = start + (end - start) * t;
 
-                    for (int y = 0; y < vleni; y++)
+                    bufferSize += 1;
+
+                    Points[bufferLastPoint] = new ClothPoint(this, bufferLastPoint);
+                    PointsData[bufferLastPoint] = new ClothPointData(pos, pos, 1.0); // TODO mass
+
+                    if (bufferSize >= 2)
                     {
-                        var th = a / hlen;
-                        var tv = y / vlen;
-
-                        Points2d[a].Points.Add(new ClothPoint(this, index++, start.X + dir.X * th, start.Y + dir.Y * tv, start.Z + dir.Z * th));
-
-                        // add a vertical constraint
-                        if (a > 0)
-                        {
-                            ClothPoint p1 = Points2d[a - 1].Points[y];
-                            ClothPoint p2 = Points2d[a].Points[y];
-
-                            var points = new ClothPoint[2] {p1, p2};
-
-                            var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
-                            constraint.TargetDistance = Resolution;
-                            Constraints.Add(constraint);
-                        }
-
-                        // add a new horizontal constraints
-                        if (y > 0)
-                        {
-                            ClothPoint p1 = Points2d[a].Points[y - 1];
-                            ClothPoint p2 = Points2d[a].Points[y];
-
-                            var points = new ClothPoint[2] {p1, p2};
-
-                            var constraint = new ClothConstraint(points, ConstraintType.Distance, 1000.0);
-                            constraint.TargetDistance = Resolution;
-                            Constraints.Add(constraint);
-                        }
+                        DistanceConstraints[bufferLastDist] = new DistanceConstraint {
+                            TargetDistance = RopeSegmentLength,
+                            Compliance = DistanceCompliance,
+                            Damping = DistanceDamping,
+                            PointIndex1 = prevIdx(bufferLastPoint, 1),
+                            PointIndex2 = bufferLastPoint,
+                            Comparison = ConstraintComparison.Equal,
+                        };
                     }
+
+                    if (bufferSize >= 3)
+                    {
+                        AngleConstraints[bufferLastAngle] = new AngleConstraint {
+                            TargetAngleCos = AngleTarget,
+                            Compliance = AngleCompliance,
+                            Damping = AngleDamping,
+                            PointIndex1 = prevIdx(bufferLastPoint, 2),
+                            PointIndex2 = prevIdx(bufferLastPoint, 1),
+                            PointIndex3 = bufferLastPoint,
+                            Comparison = ConstraintComparison.Equal,
+                        };
+                    }
+
+                    remLength -= RopeSegmentLength;
                 }
-                break;
-            }
+
+                bufferSize += 1;
+
+                Points[bufferLastPoint] = new ClothPoint(this, bufferLastPoint);
+                PointsData[bufferLastPoint] = new ClothPointData(end, end, 1.0); // TODO mass
+
+                if (bufferSize >= 2)
+                {
+                    DistanceConstraints[bufferLastDist] = new DistanceConstraint {
+                        TargetDistance = (float)remLength,
+                        Compliance = DistanceCompliance,
+                        Damping = DistanceDamping,
+                        PointIndex1 = prevIdx(bufferLastPoint, 1),
+                        PointIndex2 = bufferLastPoint,
+                        Comparison = ConstraintComparison.Equal,
+                    };
+                }
+
+                if (bufferSize >= 3)
+                {
+                    AngleConstraints[bufferLastAngle] = new AngleConstraint {
+                        TargetAngleCos = AngleTarget,
+                        Compliance = AngleCompliance,
+                        Damping = AngleDamping,
+                        PointIndex1 = prevIdx(bufferLastPoint, 2),
+                        PointIndex2 = prevIdx(bufferLastPoint, 1),
+                        PointIndex3 = bufferLastPoint,
+                        Comparison = ConstraintComparison.Equal,
+                    };
+                }
+
+                RopeLength = (float)length;
             }
         }
 
@@ -338,11 +633,17 @@ namespace Vintagestory.GameContent
 
             int vertexIndex = 0;
 
-            for (int i = 0; i < Constraints.Count; i++)
+            for (int i = 0; i < bufferSize - 1; i++)
             {
-                var c = Constraints[i];
+                int idx1 = (bufferHead + i) % MaxBufferSize;
+                int idx2 = (bufferHead + i + 1) % MaxBufferSize;
+
+                ref var p1 = ref PointsData[idx1];
+                ref var p2 = ref PointsData[idx2];
+
                 int color = (i % 2) > 0 ? ColorUtil.WhiteArgb : ColorUtil.BlackArgb;
 
+                // FIXME this probably should use point coords?
                 debugUpdateMesh.AddVertexSkipTex(0, 0, 0, color);
                 debugUpdateMesh.AddVertexSkipTex(0, 0, 0, color);
 
@@ -358,28 +659,23 @@ namespace Vintagestory.GameContent
             debugUpdateMesh.Rgba = null;
         }
 
-        
-
         public void Init(ICoreAPI api, ClothManager cm)
         {
             this.api = api;
             this.capi = api as ICoreClientAPI;
-            pp = cm.partPhysics;
-            this.BlockAccess = pp.BlockAccess;
-            this.timeStepData = new TimeStepData(pp.PhysicsTickTime, SubstepCount);
+            this.BlockAccess = api.World.BlockAccessor;
+            this.timeStepData = new TimeStepData(GlobalConstants.PhysicsFrameTime, SubstepCount);
 
             noiseGen = NormalizedSimplexNoise.FromDefaultOctaves(4, 100, 0.9, api.World.Seed + CenterPosition.GetHashCode());
         }
 
-
         public void WalkPoints(Action<ClothPoint> onPoint)
         {
-            foreach (var pl in Points2d)
+            for (int i = 0; i < bufferSize; i++)
             {
-                foreach (var point in pl.Points)
-                {
-                    onPoint(point);
-                }
+                int index = (bufferHead + i) % MaxBufferSize;
+
+                onPoint(Points[index]);
             }
         }
 
@@ -390,19 +686,17 @@ namespace Vintagestory.GameContent
             Vec3d campos = capi.World.Player.Entity.CameraPos;
             int basep = cfloats.Count;
 
-
-            Vec4f lightRgba = api.World.BlockAccessor.GetLightRGBs(Constraints[Constraints.Count / 2].Point1.Pos.AsBlockPos);
-
-            for (int i = 0; i < Constraints.Count; i++)
+            for (int i = 0; i < bufferSize - 1; i++)
             {
-                ClothConstraint cc = Constraints[i];
-                Vec3d p1 = cc.Point1.Pos;
-                Vec3d p2 = cc.Point2.Pos;
+                int idx1 = (bufferHead + i) % MaxBufferSize;
+                int idx2 = (bufferHead + i + 1) % MaxBufferSize;
+
+                ref FastVec3d p1 = ref PointsData[idx1].Pos;
+                ref FastVec3d p2 = ref PointsData[idx2].Pos;
 
                 double dX = p1.X - p2.X;
                 double dY = p1.Y - p2.Y;
                 double dZ = p1.Z - p2.Z;
-
 
                 float yaw = (float)Math.Atan2(dX, dZ) + GameMath.PIHALF;
                 float pitch = (float)Math.Atan2(Math.Sqrt(dZ * dZ + dX * dX), dY) + GameMath.PIHALF;
@@ -433,7 +727,13 @@ namespace Vintagestory.GameContent
                 Mat4f.Scale(tmpMat, tmpMat, new float[] { length, 1, 1 }); // + (float)Math.Sin(api.World.ElapsedMilliseconds / 1000f) * 0.1f
                 Mat4f.Translate(tmpMat, tmpMat, -1.5f, -1 / 32f, -0.5f); // not sure why the -1.5 here instead of -0.5
 
+                var midPoint = new Vec3d(
+                    (p1.X + p2.X) / 2,
+                    (p1.Y + p2.Y) / 2,
+                    (p1.Z + p2.Z) / 2
+                );
 
+                Vec4f lightRgba = api.World.BlockAccessor.GetLightRGBs(midPoint.AsBlockPos);
 
                 int j = basep + i * 20;
                 cfloats.Values[j++] = lightRgba.R;
@@ -447,7 +747,7 @@ namespace Vintagestory.GameContent
                 }
             }
 
-            return Constraints.Count;
+            return SegmentCount;
         }
 
 
@@ -456,21 +756,21 @@ namespace Vintagestory.GameContent
         /// </summary>
         public void setRenderCenterPos()
         {
-            for (int i = 0; i < Constraints.Count; i++)
-            {
-                ClothConstraint cc = Constraints[i];
+            // for (int i = 0; i < Constraints.Count; i++)
+            // {
+            //     ClothConstraint cc = Constraints[i];
 
-                Vec3d start = cc.Point1.Pos;
-                Vec3d end = cc.Point2.Pos;
+            //     Vec3d start = cc.Point1.Pos;
+            //     Vec3d end = cc.Point2.Pos;
 
-                double nowx = start.X + (start.X - end.X) / 2;
-                double nowy = start.Y + (start.Y - end.Y) / 2;
-                double nowz = start.Z + (start.Z - end.Z) / 2;
+            //     double nowx = start.X + (start.X - end.X) / 2;
+            //     double nowy = start.Y + (start.Y - end.Y) / 2;
+            //     double nowz = start.Z + (start.Z - end.Z) / 2;
 
-                cc.renderCenterPos.X = nowx;
-                cc.renderCenterPos.Y = nowy;
-                cc.renderCenterPos.Z = nowz;
-            }
+            //     cc.renderCenterPos.X = nowx;
+            //     cc.renderCenterPos.Y = nowy;
+            //     cc.renderCenterPos.Z = nowz;
+            // }
         }
 
 
@@ -484,11 +784,13 @@ namespace Vintagestory.GameContent
 
                 BlockPos originPos = CenterPosition.AsBlockPos;
 
-                for (int i = 0; i < Constraints.Count; i++)
+                for (int i = 0; i < bufferSize - 1; i++)
                 {
-                    ClothConstraint cc = Constraints[i];
-                    Vec3d p1 = cc.Point1.Pos;
-                    Vec3d p2 = cc.Point2.Pos;
+                    int idx1 = (bufferHead + i) % MaxBufferSize;
+                    int idx2 = (bufferHead + i + 1) % MaxBufferSize;
+
+                    ref FastVec3d p1 = ref PointsData[idx1].Pos;
+                    ref FastVec3d p2 = ref PointsData[idx2].Pos;
 
                     debugUpdateMesh.xyz[i * 6 + 0] = (float)(p1.X - originPos.X);
                     debugUpdateMesh.xyz[i * 6 + 1] = (float)(p1.Y - originPos.Y) + 0.005f;
@@ -553,156 +855,128 @@ namespace Vintagestory.GameContent
                 else
                 {
                     substepNow(false, (double)accum_step / SubstepCount);
-
                 }
             }
         }
 
-        CachedCuboidList CollisionBoxList = new CachedCuboidList();
-        Cuboidd particleCollBox = new Cuboidd();
-        Cuboidd blockCollBox = new Cuboidd();
-        BlockPos minPos = new BlockPos();
-        BlockPos maxPos = new BlockPos();
+        void gatherCollisionConstraints()
+        {
+            CollisionConstraints.Clear();
+
+            BlockPos minPos = new BlockPos();
+            BlockPos maxPos = new BlockPos();
+
+            for (int i = 0; i < bufferSize - 1; i++)
+            {
+                int idx1 = (bufferHead + i) % MaxBufferSize;
+                int idx2 = (bufferHead + i + 1) % MaxBufferSize;
+
+                ref FastVec3d p1 = ref PointsData[idx1].Pos;
+                ref FastVec3d p2 = ref PointsData[idx2].Pos;
+
+                double minX = Math.Min(p1.X, p2.X);
+                double maxX = Math.Max(p1.X, p2.X);
+
+                double minY = Math.Min(p1.Y, p2.Y);
+                double maxY = Math.Max(p1.Y, p2.Y);
+
+                double minZ = Math.Min(p1.Z, p2.Z);
+                double maxZ = Math.Max(p1.Z, p2.Z);
+
+                const double safeguardDist = 1.0;
+
+                minPos.SetAndCorrectDimension(
+                    (int)(minX - RopeWidth / 2 - safeguardDist),
+                    (int)(minY - RopeWidth / 2 - safeguardDist),
+                    (int)(minZ - RopeWidth / 2 - safeguardDist)
+                );
+
+                maxPos.SetAndCorrectDimension(
+                    (int)(maxX + RopeWidth / 2 + safeguardDist),
+                    (int)(maxY + RopeWidth / 2 + safeguardDist),
+                    (int)(maxZ + RopeWidth / 2 + safeguardDist)
+                );
+
+                BlockAccess.WalkBlocks(minPos, maxPos, (cblock, x, y, z) => {
+                    Cuboidf[] collisionBoxes = cblock.GetCollisionBoxes(BlockAccess, null);
+
+                    if (collisionBoxes != null)
+                    {
+                        foreach (var cuboid in collisionBoxes)
+                        {
+                            if (cuboid != null)
+                            {
+                                CollisionConstraints.Add(new LineSegemntCollisionConstraint{
+                                    minBoxBounds = new FastVec3f(cuboid.MinX, cuboid.MinY, cuboid.MinZ),
+                                    maxBoxBounds = new FastVec3f(cuboid.MaxX, cuboid.MaxY, cuboid.MaxZ),
+                                    Friction = 0, // TODO vary friction depending on the block
+                                    PointIndex1 = (ushort)idx1,
+                                    PointIndex2 = (ushort)idx2,
+                                });
+                            }
+                        }
+                    }
+                });
+            }
+
+        }
 
         void substepNow(bool isFullStep, double stepRatio)
         {
-            for (int i = 0; i < Points2d.Count; i++)
+            for (int i = 0; i < bufferSize; i++)
             {
-                for (int j = 0; j < Points2d[i].Points.Count; j++)
+                int idx = (bufferHead + i) % MaxBufferSize;
+                ref var point = ref PointsData[idx];
+
+                point.substepUpdate(this, Points[idx], timeStepData, stepRatio, Forces);
+            }
+
+            var lengthConstraint = new LengthConstraint {
+                TargetLength = RopeLength,
+                Compliance = LengthCompliance,
+                Damping = LengthDamping,
+                Comparison = ConstraintComparison.Equal,
+            };
+
+            lengthConstraint.Update(PointsData, bufferHead, bufferSize, MaxBufferSize, timeStepData, Forces);
+
+            for (int i = 0; i < bufferSize; i++)
+            {
+                int idx = (bufferHead + i) % MaxBufferSize;
+                ref var constraint = ref DistanceConstraints[idx];
+
+                constraint.Update(PointsData, timeStepData, SegmentDistances[idx], LengthCompliance, LengthDamping, Forces);
+            }
+
+            for (int i = 0; i < bufferSize; i++)
+            {
+                int idx = (bufferHead + i) % MaxBufferSize;
+                ref var constraint = ref AngleConstraints[idx];
+
+                constraint.Update(PointsData, timeStepData, Forces);
+            }
+
+            var collisionSpan = CollectionsMarshal.AsSpan<LineSegemntCollisionConstraint>(CollisionConstraints);
+
+            for (int i = 0; i < collisionSpan.Length; i++)
+            {
+                ref var constraint = ref collisionSpan[i];
+
+                constraint.Update(PointsData, timeStepData, Forces);
+            }
+
+            if (isFullStep)
+            {
+                for (int i = 0; i < bufferSize; i++)
                 {
-                    Points2d[i].Points[j].substepUpdate(timeStepData, stepRatio);
+                    int idx = (bufferHead + i) % MaxBufferSize;
+                    ref var point = ref Points[idx];
 
-                    if (isFullStep) {
-                        Points2d[i].Points[j].stepUpdate(timeStepData, api.World);
-                    }
-                }
-            }
-
-            for (int k = 0; k < IterationCount; k++)
-            {
-                for (int i = 0; i < Constraints.Count; i++)
-                {
-                    var constraint = Constraints[i];
-
-                    constraint.Update(timeStepData);
+                    point.stepUpdate(timeStepData, api.World);
                 }
 
-                double size = 0.1;
-                {
-                    int pointIdx = 0;
-
-                    // Handle collision constraints
-                    for (int i = 0; i < Points2d.Count; i++)
-                    {
-                        for (int j = 0; j < Points2d[i].Points.Count; j++)
-                        {
-                            var p = Points2d[i].Points[j];
-
-                            minPos.SetAndCorrectDimension(
-                                (int)(p.Pos.X - size / 2),
-                                (int)(p.Pos.Y - size / 2), // -1 for the extra high collision box of fences
-                                (int)(p.Pos.Z - size / 2)
-                            );
-
-                            maxPos.SetAndCorrectDimension(
-                                (int)(p.Pos.X + size / 2),
-                                (int)(p.Pos.Y + size / 2),
-                                (int)(p.Pos.Z + size / 2)
-                            );
-
-                            BlockAccess.WalkBlocks(minPos, maxPos, (cblock, x, y, z) => {
-                                Cuboidf[] collisionBoxes = cblock.GetCollisionBoxes(BlockAccess, new BlockPos());
-
-                                if (collisionBoxes != null)
-                                {
-                                    for (var c = 0; c < collisionBoxes.Count(); c++) {
-                                        var collBox = collisionBoxes[c];
-
-                                        if (collBox == null) continue;
-
-                                        blockCollBox.SetAndTranslate(collBox, x, y, z);
-                                        blockCollBox.GrowBy(size / 2, size / 2, size / 2);
-
-                                        double constraintValue = 0;
-                                        Vec3d gradient;
-
-                                        CalcCollisionConstraint(p.Pos, blockCollBox, out constraintValue, out gradient);
-
-                                        UpdatePointOnCollision(p, constraintValue, gradient);
-                                    }
-                                }
-
-                            }, false);
-
-                            pointIdx++;
-                        }
-                    }
-                }
+                gatherCollisionConstraints();
             }
-
-
-            // CollisionBoxList.Clear();
-            //
-
-
-
-        }
-
-        public void CalcCollisionConstraint(Vec3d pos, Cuboidd coll, out double value, out Vec3d gradient)
-        {
-            const double epsilon = 0.000001;
-
-            var collCenter = new Vec3d(
-                (coll.MaxX + coll.MinX) / 2.0,
-                (coll.MaxY + coll.MinY) / 2.0,
-                (coll.MaxZ + coll.MinZ) / 2.0
-            );
-
-            double dx = (pos.X - collCenter.X);
-            double dy = (pos.Y - collCenter.Y);
-            double dz = (pos.Z - collCenter.Z);
-
-            double abs_dx = Math.Abs(dx);
-            double abs_dy = Math.Abs(dy);
-            double abs_dz = Math.Abs(dz);
-
-            double vx = abs_dx - coll.Width / 2.0;
-            double vy = abs_dy - coll.Height / 2.0;
-            double vz = abs_dz - coll.Length / 2.0;
-
-            if (vx >= vy && vx >= vz)
-            {
-                value = vx;
-                if (abs_dx > epsilon) gradient = new Vec3d(Math.Sign(dx), 0, 0);
-                else gradient = new Vec3d(1, 0, 0);
-            }
-            else if (vy >= vx && vy >= vz)
-            {
-                value = vy;
-                if (abs_dy > epsilon) gradient = new Vec3d(0.0, Math.Sign(dy), 0.0);
-                else gradient = new Vec3d(0, 1, 0);
-            }
-            else
-            {
-                value = vz;
-                if (abs_dz > epsilon) gradient = new Vec3d(0, 0, Math.Sign(dz));
-                else gradient = new Vec3d(0, 0, 1);
-            }
-        }
-
-        public void UpdatePointOnCollision(ClothPoint point, double constraintValue, Vec3d constraintGradient)
-        {
-            const double epsilon = 0.000001;
-
-            if (constraintValue > 0.0 || point.InvMass < epsilon) return;
-
-            double alpha = 0.0 * timeStepData.InvSubstepTimeSqr;
-            double lambda_delta =
-                ( -constraintValue ) /
-                ( constraintGradient.LengthSq() * point.InvMass +
-                  alpha );
-
-            point.Pos += point.InvMass * constraintGradient * lambda_delta;
         }
 
         public void slowTick3s()
@@ -716,16 +990,13 @@ namespace Vintagestory.GameContent
         {
             if (!Active) return;
 
-            Dictionary<int, ClothPoint> pointsByIndex = new Dictionary<int, ClothPoint>();
-            WalkPoints((p) => {
-                pointsByIndex[p.PointIndex] = p;
-                p.restoreReferences(this, api.World);
-            });
-
-            foreach (var c in Constraints)
+            for (int i = 0; i < bufferSize; i++)
             {
-                c.RestorePoints(pointsByIndex);
-            }            
+                int idx = (bufferHead + i) % MaxBufferSize;
+                ref var point = ref Points[idx];
+
+                point.restoreReferences(this, api.World);
+            }
         }
 
         public void updateActiveState(EnumActiveStateChange stateChange)
@@ -736,43 +1007,50 @@ namespace Vintagestory.GameContent
             bool wasActive = Active;
 
             Active = true;
-            WalkPoints((p) => {
-                Active &= api.World.BlockAccessor.GetChunkAtBlockPos((int)p.Pos.X, (int)p.Pos.Y, (int)p.Pos.Z) != null;
-            });
+
+            for (int i = 0; i < bufferSize; i++)
+            {
+                int idx = (bufferHead + i) % MaxBufferSize;
+                ref var point = ref PointsData[idx];
+
+                Active &= api.World.BlockAccessor.GetChunkAtBlockPos((int)point.Pos.X, (int)point.Pos.Y, (int)point.Pos.Z) != null;
+            }
 
             if (!wasActive && Active) restoreReferences();
         }
 
-
-
-
         public void CollectDirtyPoints(List<ClothPointPacket> packets)
         {
-            for (int i = 0; i < Points2d.Count; i++)
+            for (int i = 0; i < bufferSize; i++)
             {
-                for (int j = 0; j < Points2d[i].Points.Count; j++)
+                int idx = (bufferHead + i) % MaxBufferSize;
+                var point = Points[idx];
+
+                if (point.Dirty)
                 {
-                    var point = Points2d[i].Points[j];
-                    if (point.Dirty)
-                    {
-                        packets.Add(new ClothPointPacket() { ClothId = ClothId, PointX = i, PointY = j, Point = point });
-                        point.Dirty = false;
-                    }
+                    packets.Add(new ClothPointPacket() {
+                        ClothId = ClothId,
+                        PointId = i,
+                        Point = point,
+                        PointData = PointsData[i]
+                    });
+
+                    point.Dirty = false;
                 }
             }
         }
 
         public void updatePoint(ClothPointPacket msg)
         {
-            ClothPoint point = Points2d[msg.PointX].Points[msg.PointY];
-            point.updateFromPoint(msg.Point, api.World);
+            // TODO FIXME rewrite network sync
+            Points[msg.PointId].updateFromPoint(msg.Point, api.World);
+
+            PointsData[msg.PointId] = msg.PointData;
         }
 
         public void OnPinnnedEntityLoaded(Entity entity)
         {
-            if (FirstPoint.pinnedToEntityId == entity.EntityId) FirstPoint.restoreReferences(entity);
-            if (LastPoint.pinnedToEntityId == entity.EntityId) LastPoint.restoreReferences(entity);
-
+            PinStorage.restoreReferences(entity);
         }
     }
 
