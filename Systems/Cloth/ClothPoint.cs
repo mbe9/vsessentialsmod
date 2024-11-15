@@ -1,150 +1,166 @@
 ﻿using ProtoBuf;
 using System;
+using System.Collections.Generic;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Util;
 using Vintagestory.API.Datastructures;
+using System.Runtime.InteropServices;
 
 namespace Vintagestory.GameContent
 {
+    public enum ClothPointFlags : byte
+    {
+        PositionFixed = 1 << 0,
+        Pinned = 1 << 1,
+    }
+
+    [ProtoContract]
+    public struct ClothPointData
+    {
+        [ProtoMember(1)]
+        public FastVec3d Pos;
+        [ProtoMember(2)]
+        public FastVec3d PrevPos;
+        [ProtoMember(3)]
+        public float InvMass;
+        [ProtoMember(4)]
+        public float GravityStrength = 1;
+        [ProtoMember(5)]
+        public byte Movable = 1;
+        [ProtoMember(6)]
+        public byte Pinned = 0;
+
+        public ClothPointData() {}
+
+        // public void SetFlag(ClothPointFlags flag, bool value)
+        // {
+        //     if (value)
+        //     {
+        //         flags |= flag;
+        //     }
+        //     else
+        //     {
+        //         flags &= ~flag;
+        //     }
+        // }
+
+        public void substepUpdate(ClothSystem cs, ClothPoint p, TimeStepData time, double stepRatio)
+        {
+            if (Movable == 0) return;
+
+            if (Pinned == 0)
+            {
+                // 1.0 if the point is NOT colliding, 0.0 otherwise
+                // Done this way to remove branching
+                // double isNotCollidingMult = 1.0 - (double)(flags & (byte)ClothPointFlags.IsColliding);
+
+                FastVec3d accel;
+                accel.X = 0.0;//InvMass * cs.windSpeed.X * isNotCollidingMult;
+                accel.Y = - InvMass * GravityStrength * 10.0;
+                accel.Z = 0.0;
+
+                // Verlet integration scheme
+                // x_(n+1) = 2 * x_(n) - x_(n-1) + accel * dt^2
+                (PrevPos.X, Pos.X) = (Pos.X, 2.0 * Pos.X - PrevPos.X + accel.X * (time.SubstepTime * time.SubstepTime));
+                (PrevPos.Y, Pos.Y) = (Pos.Y, 2.0 * Pos.Y - PrevPos.Y + accel.Y * (time.SubstepTime * time.SubstepTime));
+                (PrevPos.Z, Pos.Z) = (Pos.Z, 2.0 * Pos.Z - PrevPos.Z + accel.Z * (time.SubstepTime * time.SubstepTime));
+            }
+            else
+            {
+                if (p.pinInfo != null)
+                {
+                    Pos.X = p.pinInfo.PrevPinnedPos.X * (1.0 - stepRatio) + p.pinInfo.CurrPinnedPos.X * stepRatio;
+                    Pos.Y = p.pinInfo.PrevPinnedPos.Y * (1.0 - stepRatio) + p.pinInfo.CurrPinnedPos.Y * stepRatio;
+                    Pos.Z = p.pinInfo.PrevPinnedPos.Z * (1.0 - stepRatio) + p.pinInfo.CurrPinnedPos.Z * stepRatio;
+                }
+            }
+        }
+    }
+
     [ProtoContract]
     public class ClothPoint
     {
-        public static bool PushingPhysics = false;
-
         [ProtoMember(1)]
-        public int PointIndex;
+        float OriginalMass = 1.0f;
         [ProtoMember(2)]
-        public double InvMass;
+        int pinId = -1;
         [ProtoMember(3)]
-        public Vec3d Pos;
-        [ProtoMember(4)]
-        public Vec3d PrevPos;
-        // [ProtoMember(6)]
-        // public Vec3f Tension = new Vec3f();
-        [ProtoMember(7)]
-        float GravityStrength = 1;
-        [ProtoMember(8)]
-        bool pinned;
-        [ProtoMember(9)]
-        public long pinnedToEntityId;
-        [ProtoMember(10)]
-        BlockPos pinnedToBlockPos;
-        [ProtoMember(11)]
-        public Vec3f pinnedToOffset;
-        [ProtoMember(12)]
-        float pinnedToOffsetStartYaw;
-        [ProtoMember(13)]
-        string pinnedToPlayerUid; // player entity ids change over time >.<
+        ushort PointIndex;
 
-        Vec3d CurrPinnedPos;
-        Vec3d PrevPinnedPos;
+        public ClothPinInfo pinInfo;
+        public ClothPinStorage pinStorage;
+        public List<ClothPointData> pointsData;
 
-        // public float InvMass;
+        ClothSystem cs;
+
+        double accum1s;
 
         public bool Dirty { get; internal set; }
 
-
-        public EnumCollideFlags CollideFlags;
-        public float YCollideRestMul;
-        Vec4f tmpvec = new Vec4f();
-        ClothSystem cs;
-        Entity pinnedTo;
-        Matrixf pinOffsetTransform;
-
-        // These values are set be the constraints, they should actually get summed up though. 
-        // For rope, a single set works though, because we only need the ends, connected by 1 constraint
-        // In otherwords: Cloth pulling motion thing is not supported
-        // public Vec3d TensionDirection = new Vec3d();
-        // public double extension;
-
-
-        // Damping factor. Velocities are multiplied by this
-        // private float dampFactor = 0.9f;
-
-        double accum1s;
-        bool extraResist = false;
-
-        public ClothPoint(ClothSystem cs)
+        public ClothPoint(ClothSystem cs, ushort pointIndex)
         {
             this.cs = cs;
-            Pos = new Vec3d();
-            PrevPos = new Vec3d();
-            init();
+            this.pinStorage = cs.PinStorage;
+            this.pointsData = cs.PointsData;
+
+            this.PointIndex = pointIndex;
         }
 
         protected ClothPoint() { }
 
-        public ClothPoint(ClothSystem cs, int pointIndex, double x, double y, double z)
+        ref ClothPointData getPointData()
         {
-            this.cs = cs;
-            this.PointIndex = pointIndex;
-            Pos = new Vec3d(x, y, z);
-            PrevPos = new Vec3d(x, y, z);
-            init();
+            var pointSpan = CollectionsMarshal.AsSpan<ClothPointData>(pointsData);
+
+            return ref pointSpan[PointIndex];
         }
 
-        public void setMass(double mass)
+        public Entity PinnedToEntity => pinInfo?.pinnedTo;
+        public BlockPos PinnedToBlockPos => pinInfo?.pinnedToBlockPos;
+        public bool Pinned => (pinInfo != null);
+
+
+        public void PinTo(Entity toEntity, Vec3f offset)
         {
-            InvMass = 1.0 / mass;
-        }
+            if (pinId >= 0) return;
 
-        void init()
-        {
-            setMass(1);
-        }
+            pinId = pinStorage.AddPin(toEntity, offset);
+            pinInfo = pinStorage.GetPin(pinId);
 
-        public Entity PinnedToEntity => pinnedTo;
-        public BlockPos PinnedToBlockPos => pinnedToBlockPos;
-        public bool Pinned => pinned;
-
-
-        public void PinTo(Entity toEntity, Vec3f pinOffset)
-        {
-            pinned = true;
-            pinnedTo = toEntity;
-            pinnedToEntityId = toEntity.EntityId;
-            pinnedToOffset = pinOffset;
-            pinnedToOffsetStartYaw = toEntity.SidedPos.Yaw;
-            pinOffsetTransform = Matrixf.Create();
-            pinnedToBlockPos = null;
-            if (toEntity is EntityPlayer eplr) pinnedToPlayerUid = eplr.PlayerUID;
-            setMass(toEntity.Properties.Weight);
-
-            PrevPinnedPos = getPinnedPos();
-            CurrPinnedPos = PrevPinnedPos;
+            getPointData().Pinned = 1;
+            getPointData().Movable = 1;
+            // getPointData().InvMass = 1.0f / toEntity.Properties.Weight;
 
             MarkDirty();
         }
 
         public void PinTo(BlockPos blockPos, Vec3f offset)
         {
-            this.pinnedToBlockPos = blockPos;
-            pinnedToOffset = offset;
-            pinnedToPlayerUid = null;
-            pinned = true;
-            pinnedTo = null;
-            pinnedToEntityId = 0;
-            // Blocks are unmovable, as if they have infinite mass
-            InvMass = 0.0;
+            if (pinId >= 0) return;
 
-            Pos.Set(pinnedToBlockPos).Add(pinnedToOffset);
-            PrevPinnedPos = Pos;
-            CurrPinnedPos = Pos;
+            pinId = pinStorage.AddPin(blockPos, offset);
+            pinInfo = pinStorage.GetPin(pinId);
+
+            getPointData().Pinned = 1;
+            getPointData().Movable = 0;
+            // Blocks are unmovable, as if they have infinite mass
+            // getPointData().InvMass = 0.0f;
 
             MarkDirty();
         }
 
         public void UnPin()
         {
-            pinned = false;
-            pinnedTo = null;
-            pinnedToPlayerUid = null;
-            pinnedToEntityId = 0;
-            // TODO: get original point properties from clothsystem
-            setMass(1.0);
+            pinStorage.RemovePin(pinId);
+            pinId = -1;
+            pinInfo = null;
+
+            getPointData().Pinned = 0;
+            getPointData().Movable = 1;
+            // getPointData().InvMass = 1.0f / OriginalMass;
 
             MarkDirty();
         }
@@ -154,48 +170,20 @@ namespace Vintagestory.GameContent
             Dirty = true;
         }
 
-        public void substepUpdate(TimeStepData time, double stepRatio)
-        {
-            const double epsilon = 0.00001;
-
-            if (InvMass < epsilon) return;
-
-            Vec3d force = Vec3d.Zero; //Tension.Clone();
-            force.Y -= GravityStrength * 10;
-
-            // Calculate the acceleration
-            Vec3d acceleration = force * InvMass;
-
-            if (CollideFlags == 0)
-            {
-                acceleration.X += (float)cs.windSpeed.X * InvMass;
-            }
-
-            // Verlet integration scheme
-            Vec3d newPos = 2 * Pos - PrevPos + (acceleration * time.SubstepTime * time.SubstepTime);
-
-            PrevPos = Pos;
-            Pos = newPos;
-
-            if (pinned && CurrPinnedPos != null && PrevPinnedPos != null)
-            {
-                Pos = PrevPinnedPos * (1.0 - stepRatio) + CurrPinnedPos * stepRatio;
-            }
-        }
 
         public void stepUpdate(TimeStepData time, IWorldAccessor world)
         {
-            if (pinnedTo == null && pinnedToPlayerUid != null)
+            if (pinInfo != null && pinInfo.pinnedTo == null && pinInfo.pinnedToPlayerUid != null)
             {
-                var eplr = world.PlayerByUid(pinnedToPlayerUid)?.Entity;
-                if (eplr?.World != null) PinTo(eplr, pinnedToOffset);
+                var eplr = world.PlayerByUid(pinInfo.pinnedToPlayerUid)?.Entity;
+                if (eplr?.World != null) pinInfo.pinnedTo = eplr;
             }
 
-            if (pinned) 
+            if (pinInfo != null)
             {
-                if (pinnedTo != null)
+                if (pinInfo.pinnedTo != null)
                 {
-                    if (pinnedTo.ShouldDespawn && pinnedTo.DespawnReason?.Reason != EnumDespawnReason.Unload)
+                    if (pinInfo.pinnedTo.ShouldDespawn && pinInfo.pinnedTo.DespawnReason?.Reason != EnumDespawnReason.Unload)
                     {
                         UnPin();
                         return;
@@ -205,54 +193,26 @@ namespace Vintagestory.GameContent
                     // don't apply force onto the player/entity on compression
                     // apply huge forces onto the player on strong extension (to prevent massive stretching) (just set player motion to 0 or so. or we add a new countermotion field thats used in EntityControlledPhysics?) 
 
-                    float weight = pinnedTo.Properties.Weight;
+                    var weight = pinInfo.pinnedTo.Properties.Weight;
                     
                     float counterTensionStrength = GameMath.Clamp(50f / weight, 0.1f, 2f);
 
-                    bool extraResistNew =
-                        (pinnedTo as EntityAgent)?.Controls.Sneak == true
-                        || (pinnedTo is EntityPlayer
-                            && (pinnedTo.AnimManager?.IsAnimationActive("sit") == true
-                                || pinnedTo.AnimManager?.IsAnimationActive("sleep") == true));
+                    bool extraResist =
+                        (pinInfo.pinnedTo as EntityAgent)?.Controls.Sneak == true
+                        || (pinInfo.pinnedTo is EntityPlayer
+                            && (pinInfo.pinnedTo.AnimManager?.IsAnimationActive("sit") == true
+                                || pinInfo.pinnedTo.AnimManager?.IsAnimationActive("sleep") == true));
 
-                    if (extraResistNew != extraResist){
-                        if (extraResistNew) {
-                            setMass(weight * 200);
-                        } else {
-                            InvMass *= 200;
-                        }
-                        extraResist = extraResistNew;
-                    }
+                    // TODO: apply the extra inertia to the player, not the point
+                    // if (extraResist) {
+                    //     getPointData().InvMass = 1.0f / (weight * 200.0f);
+                    // } else {
+                    //     getPointData().InvMass = 1.0f / weight;
+                    // }
 
-                    // float tensionResistStrength = weight / 10f * (extraResist ? 200 : 1);
+                    pinInfo.PrevPinnedPos = pinInfo.CurrPinnedPos;
+                    pinInfo.CurrPinnedPos = pinInfo.getPinnedPos();
 
-                    var eplr = pinnedTo as EntityPlayer;
-                    var eagent = pinnedTo as EntityAgent;
-                    Vec4f outvec;
-
-                    AttachmentPointAndPose apap = eplr?.AnimManager?.Animator?.GetAttachmentPointPose("RightHand");
-                    if (apap == null) apap = pinnedTo?.AnimManager?.Animator?.GetAttachmentPointPose("rope");
-
-                    if (apap != null)
-                    {
-                        Matrixf modelmat = new Matrixf();
-                        if (eplr != null) modelmat.RotateY(eagent.BodyYaw + GameMath.PIHALF);
-                        else modelmat.RotateY(pinnedTo.SidedPos.Yaw + GameMath.PIHALF);
-
-                        modelmat.Translate(-0.5, 0, -0.5);
-
-                        apap.MulUncentered(modelmat);
-                        outvec = modelmat.TransformVector(new Vec4f(0,0,0,1));
-                    }
-                    else
-                    {
-                        pinOffsetTransform.Identity();
-                        pinOffsetTransform.RotateY(pinnedTo.SidedPos.Yaw - pinnedToOffsetStartYaw);
-                        tmpvec.Set(pinnedToOffset.X, pinnedToOffset.Y, pinnedToOffset.Z, 1);
-                        outvec = pinOffsetTransform.TransformVector(tmpvec);
-                    }
-
-                    EntityPos pos = pinnedTo.SidedPos;
 
                     bool pushable = true;// PushingPhysics && (eplr == null || eplr.Player.WorldData.CurrentGameMode != EnumGameMode.Creative);
                     
@@ -260,13 +220,10 @@ namespace Vintagestory.GameContent
                     {
                         // pos.Motion += (Pos - PrevPos) * time.InvSubstepTime;
                     }
-
-                    PrevPinnedPos = CurrPinnedPos;
-                    CurrPinnedPos = new Vec3d(pos.X + outvec.X, pos.Y + outvec.Y, pos.Z + outvec.Z);
                 }
                 else
                 {
-                    if (pinnedToBlockPos != null)
+                    if (pinInfo.pinnedToBlockPos != null)
                     {
                         accum1s += time.StepTime;
 
@@ -281,87 +238,6 @@ namespace Vintagestory.GameContent
                         }
                     }
                 }
-            }
-            else
-            {
-                // Update velocity
-
-                // TODO: because HandleBoyancy and UpdateMotion work with velocity directly,
-                // we are losing some (most?) of the precision of Verlet integration here.
-                //
-                // More precise way to do this would be to maybe work with position only in collision and return updated one?
-
-                // Vec3f velocity = Vec3f.Zero;
-                // velocity.Set((Pos - PrevPos) * time.InvSubstepTime);
-
-                // Damp the velocity
-                // nextVelocity *= dampFactor;
-
-                // Collision detection
-                // float size = 0.1f;
-                // cs.pp.HandleBoyancy(Pos, velocity, cs.boyant, GravityStrength, (float)time.SubstepTime, size);
-                // CollideFlags = UpdateMotion(out Pos, Pos, size);
-
-                // dt *= 0.99f;
-                // Pos = PrevPos;
-                // Pos.Add(velocity.X * time.SubstepTime,
-                //         velocity.Y * time.SubstepTime,
-                //         velocity.Z * time.SubstepTime);
-
-
-                // Velocity.Set(nextVelocity);
-                // Tension.Set(0, 0, 0);
-            }
-        }
-
-        Vec3d getPinnedPos()
-        {
-            if (pinned)
-            {
-                if (pinnedTo != null)
-                {
-                    var eplr = pinnedTo as EntityPlayer;
-                    var eagent = pinnedTo as EntityAgent;
-                    Vec4f outvec;
-
-                    AttachmentPointAndPose apap = eplr?.AnimManager?.Animator?.GetAttachmentPointPose("RightHand");
-                    if (apap == null) apap = pinnedTo?.AnimManager?.Animator?.GetAttachmentPointPose("rope");
-
-                    if (apap != null)
-                    {
-                        Matrixf modelmat = new Matrixf();
-                        if (eplr != null) modelmat.RotateY(eagent.BodyYaw + GameMath.PIHALF);
-                        else modelmat.RotateY(pinnedTo.SidedPos.Yaw + GameMath.PIHALF);
-
-                        modelmat.Translate(-0.5, 0, -0.5);
-
-                        apap.MulUncentered(modelmat);
-                        outvec = modelmat.TransformVector(new Vec4f(0,0,0,1));
-                    }
-                    else
-                    {
-                        pinOffsetTransform.Identity();
-                        pinOffsetTransform.RotateY(pinnedTo.SidedPos.Yaw - pinnedToOffsetStartYaw);
-                        tmpvec.Set(pinnedToOffset.X, pinnedToOffset.Y, pinnedToOffset.Z, 1);
-                        outvec = pinOffsetTransform.TransformVector(tmpvec);
-                    }
-
-                    EntityPos pos = pinnedTo.SidedPos;
-
-                    return new Vec3d(pos.X + outvec.X, pos.Y + outvec.Y, pos.Z + outvec.Z);
-                }
-                else if (pinnedToBlockPos != null)
-                {
-                    return new Vec3d().Set(pinnedToBlockPos).Add(pinnedToOffset);
-                }
-                else
-                {
-                    return null;
-                }
-            }
-            else
-            {
-                return null;
             }
         }
 
@@ -385,13 +261,6 @@ namespace Vintagestory.GameContent
             if (pinnedToBlockPos != null)
             {
                 PinTo(pinnedToBlockPos, pinnedToOffset);
-            }
-        }
-        public void restoreReferences(Entity entity)
-        {
-            if (pinnedToEntityId == entity.EntityId)
-            {
-                PinTo(entity, pinnedToOffset);
             }
         }
 

@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -15,13 +16,6 @@ namespace Vintagestory.GameContent
     {
         Rope,
         Cloth
-    }
-
-    [ProtoContract]
-    public class PointList 
-    {
-        [ProtoMember(1)]
-        public List<ClothPoint> Points = new List<ClothPoint>();
     }
 
     public class TimeStepData
@@ -60,11 +54,21 @@ namespace Vintagestory.GameContent
         [ProtoMember(2)]
         EnumClothType clothType;
         [ProtoMember(3)]
-        List<PointList> Points2d = new List<PointList>();
+        List<ClothPoint> Points = new List<ClothPoint>();
+        [ProtoMember(4)]
+        public List<ClothPointData> PointsData = new List<ClothPointData>();
+        [ProtoMember(4)]
+        List<DistanceConstraint> DistanceConstraints = new List<DistanceConstraint>();
+        [ProtoMember(4)]
+        List<AngleConstraint> AngleConstraints = new List<AngleConstraint>();
         [ProtoMember(4)]
         List<ClothConstraint> Constraints = new List<ClothConstraint>();
+        [ProtoMember(4)]
+        public ClothPinStorage PinStorage = new();
         [ProtoMember(5)]
         public bool Active { get; set; }
+
+        List<Cuboidf[]> cachedCollisionCuboids = new();
 
         /// <summary>
         /// 10 joints per meter
@@ -92,21 +96,7 @@ namespace Vintagestory.GameContent
         public float secondsOverStretched;
 
 
-        public bool PinnedAnywhere
-        {
-            get
-            {
-                foreach (var pointlist in Points2d)
-                {
-                    foreach (var point in pointlist.Points)
-                    {
-                        if (point.Pinned) return true;
-                    }
-                }
-
-                return false;
-            }
-        }
+        public bool PinnedAnywhere => PinStorage.Count > 0;
 
         // FIXME
         public double MaxExtension => 0;//Constraints.Count == 0 ? 0 : Constraints.Max(c => c.Extension);
@@ -139,15 +129,8 @@ namespace Vintagestory.GameContent
             }
         }
 
-        public ClothPoint FirstPoint => Points2d[0].Points[0];
-        public ClothPoint LastPoint
-        {
-            get
-            {
-                var points = Points2d[Points2d.Count - 1].Points;
-                return points[points.Count - 1];
-            }
-        }
+        public ClothPoint FirstPoint => Points[0];
+        public ClothPoint LastPoint => Points[Points.Count - 1];
 
         public ClothPoint[] Ends => new ClothPoint[] { FirstPoint, LastPoint };
 
@@ -374,12 +357,9 @@ namespace Vintagestory.GameContent
 
         public void WalkPoints(Action<ClothPoint> onPoint)
         {
-            foreach (var pl in Points2d)
+            foreach (var point in Points)
             {
-                foreach (var point in pl.Points)
-                {
-                    onPoint(point);
-                }
+                onPoint(point);
             }
         }
 
@@ -456,21 +436,21 @@ namespace Vintagestory.GameContent
         /// </summary>
         public void setRenderCenterPos()
         {
-            for (int i = 0; i < Constraints.Count; i++)
-            {
-                ClothConstraint cc = Constraints[i];
+            // for (int i = 0; i < Constraints.Count; i++)
+            // {
+            //     ClothConstraint cc = Constraints[i];
 
-                Vec3d start = cc.Point1.Pos;
-                Vec3d end = cc.Point2.Pos;
+            //     Vec3d start = cc.Point1.Pos;
+            //     Vec3d end = cc.Point2.Pos;
 
-                double nowx = start.X + (start.X - end.X) / 2;
-                double nowy = start.Y + (start.Y - end.Y) / 2;
-                double nowz = start.Z + (start.Z - end.Z) / 2;
+            //     double nowx = start.X + (start.X - end.X) / 2;
+            //     double nowy = start.Y + (start.Y - end.Y) / 2;
+            //     double nowz = start.Z + (start.Z - end.Z) / 2;
 
-                cc.renderCenterPos.X = nowx;
-                cc.renderCenterPos.Y = nowy;
-                cc.renderCenterPos.Z = nowz;
-            }
+            //     cc.renderCenterPos.X = nowx;
+            //     cc.renderCenterPos.Y = nowy;
+            //     cc.renderCenterPos.Z = nowz;
+            // }
         }
 
 
@@ -553,7 +533,6 @@ namespace Vintagestory.GameContent
                 else
                 {
                     substepNow(false, (double)accum_step / SubstepCount);
-
                 }
             }
         }
@@ -563,29 +542,90 @@ namespace Vintagestory.GameContent
         Cuboidd blockCollBox = new Cuboidd();
         BlockPos minPos = new BlockPos();
         BlockPos maxPos = new BlockPos();
+        BlockPos tmp = new BlockPos();
+
+        void gatherCollisionCuboids()
+        {
+            const double size = 0.1;
+
+            var pointSpan = CollectionsMarshal.AsSpan<ClothPointData>(PointsData);
+            for (int i = 0; i < pointSpan.Length; i++)
+            {
+                ref var point = ref pointSpan[i];
+
+                minPos.SetAndCorrectDimension(
+                    (int)(point.Pos.X - size / 2) - 1,
+                    (int)(point.Pos.Y - size / 2) - 1,
+                    (int)(point.Pos.Z - size / 2) - 1
+                );
+
+                maxPos.SetAndCorrectDimension(
+                    (int)(point.Pos.X + size / 2) + 1,
+                    (int)(point.Pos.Y + size / 2) + 1,
+                    (int)(point.Pos.Z + size / 2) + 1
+                );
+
+                BlockAccess.WalkBlocks(minPos, maxPos, (cblock, x, y, z) => {
+                    Cuboidf[] collisionBoxes = cblock.GetCollisionBoxes(BlockAccess, null);
+
+                    if (cachedCollisionCuboids.Count > i)
+                    {
+                        cachedCollisionCuboids[i] = collisionBoxes;
+                    }
+                    else
+                    {
+                        cachedCollisionCuboids.Add(collisionBoxes);
+                    }
+                });
+            }
+
+        }
 
         void substepNow(bool isFullStep, double stepRatio)
         {
-            for (int i = 0; i < Points2d.Count; i++)
-            {
-                for (int j = 0; j < Points2d[i].Points.Count; j++)
-                {
-                    Points2d[i].Points[j].substepUpdate(timeStepData, stepRatio);
+            var pointSpan = CollectionsMarshal.AsSpan<ClothPointData>(PointsData);
+            var constraintsSpan = CollectionsMarshal.AsSpan<ClothConstraint>(Constraints);
 
-                    if (isFullStep) {
-                        Points2d[i].Points[j].stepUpdate(timeStepData, api.World);
-                    }
-                }
+            for (int i = 0; i < pointSpan.Length; i++)
+            {
+                ref var point = ref pointSpan[i];
+
+                point.substepUpdate(this, Points[i], timeStepData, stepRatio);
             }
 
-            for (int k = 0; k < IterationCount; k++)
+            for (int i = 0; i < constraintsSpan.Length; i++)
             {
-                for (int i = 0; i < Constraints.Count; i++)
-                {
-                    var constraint = Constraints[i];
+                ref var constraint = ref constraintsSpan[i];
 
-                    constraint.Update(timeStepData);
+                constraint.Update(pointSpan, timeStepData);
+            }
+
+            // Handle collision constraints
+            for (int i = 0; i < pointSpan.Length && i < cachedCollisionCuboids.Count; i++)
+            {
+                ref var point = ref pointSpan[i];
+
+                Cuboidf[] collisionBoxes = cachedCollisionCuboids[i];
+
+                if (cachedCollisionCuboids[i] == null) continue;
+
+                for (var c = 0; c < collisionBoxes.Count(); c++)
+                {
+                    var collBox = collisionBoxes[c];
+
+                    if (collBox == null) continue;
+
+                    blockCollBox.SetAndTranslate(collBox, x, y, z);
+                    blockCollBox.GrowBy(size / 2, size / 2, size / 2);
+
+                    double constraintValue = 0;
+                    Vec3d gradient;
+
+                    CalcCollisionConstraint(p.Pos, blockCollBox, out constraintValue, out gradient);
+
+                    UpdatePointOnCollision(p, constraintValue, gradient);
                 }
+            }
 
                 double size = 0.1;
                 {
@@ -637,15 +677,17 @@ namespace Vintagestory.GameContent
                             pointIdx++;
                         }
                     }
-                }
             }
 
+            if (isFullStep)
+            {
+                foreach (var p in Points)
+                {
+                    p.stepUpdate(timeStepData, api.World);
+                }
 
-            // CollisionBoxList.Clear();
-            //
-
-
-
+                gatherCollisionCuboids();
+            }
         }
 
         public void CalcCollisionConstraint(Vec3d pos, Cuboidd coll, out double value, out Vec3d gradient)
@@ -770,9 +812,7 @@ namespace Vintagestory.GameContent
 
         public void OnPinnnedEntityLoaded(Entity entity)
         {
-            if (FirstPoint.pinnedToEntityId == entity.EntityId) FirstPoint.restoreReferences(entity);
-            if (LastPoint.pinnedToEntityId == entity.EntityId) LastPoint.restoreReferences(entity);
-
+            pinStorage.restoreReferences(entity);
         }
     }
 
